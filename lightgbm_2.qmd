@@ -1,0 +1,332 @@
+---
+title: "Examen"
+format: html
+editor: visual
+self-contained: true
+---
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(lubridate)
+library(parsnip)
+library(bonsai)
+```
+
+```{r, message = FALSE}
+hoteles_df <- read_csv("./hoteles-entrena.csv", show_col_types = FALSE) |>
+  mutate(children = ifelse(children == "children", 1, 0))
+
+pct_children_df <- hoteles_df |> group_by(country) |> summarise(pct_children = mean(children)*100)
+
+hoteles_df <- hoteles_df |> mutate(children = as.factor(children))
+
+hoteles_df <- left_join(x=hoteles_df, y=pct_children_df, by="country")
+
+colnames(hoteles_df)[8] <- "country_code"
+```
+
+Y vemos el desbalance de clases:
+
+```{r}
+nrow(hoteles_df)
+hoteles_df |> count(children) |> 
+  mutate(pct = 100 * n / sum(n)) |> 
+  mutate(pct = round(pct, 2))
+```
+
+Obtenemos un dataset con los códigos de los países
+
+```{r message=FALSE, warning=FALSE}
+library(RCurl)
+countries_link <- getURL("https://raw.githubusercontent.com/lukes/ISO-3166-Countries-with-Regional-Codes/master/all/all.csv")
+countries <- read.csv(text=countries_link)
+countries <- countries |> select("alpha.3", "region")
+colnames(countries)[1] <- "country_code"
+countries <- countries |> 
+  mutate(region = ifelse(region == "", "Antartica", region))
+```
+
+Se usará la variable country pero hay que hacer una ingeniería de variables
+
+```{r}
+country_mode <- which.max(table(hoteles_df$country_code))
+hoteles_df <- hoteles_df |> 
+  mutate(country_code = ifelse(country_code == "NULL", names(country_mode), country_code)) |>
+  mutate(country_code = ifelse(country_code == "CN", "CHN", country_code))
+```
+
+Hacemos un join de los códigos de país para obtener su región
+
+```{r}
+hoteles_df <- left_join(x=hoteles_df, y=countries, by="country_code")
+hoteles_df <- hoteles_df |>
+  mutate(region = ifelse(country_code == "TMP", "Asia", region))
+hoteles_df <- hoteles_df |> mutate(region = as.factor(region))
+```
+
+Preparamos receta
+
+```{r}
+receta_hoteles <- recipe(children ~ 
+           hotel + lead_time + stays_in_weekend_nights + 
+           stays_in_week_nights + adults + meal +
+           region + market_segment + reserved_room_type + 
+           assigned_room_type + company + customer_type + 
+           average_daily_rate + is_repeated_guest +
+           total_of_special_requests + 
+           arrival_date + days_in_waiting_list + 
+           country_code + pct_children + is_repeated_guest +
+           previous_cancellations + previous_bookings_not_canceled, 
+           data = hoteles_df) |> 
+  step_mutate(hotel = ifelse(hotel == "Resort_Hotel", 1, 0)) |>
+  step_cut(stays_in_weekend_nights, breaks = c(0, 1, 2, 3, 4, 5), 
+           include_outside_range = TRUE) |>
+  step_cut(stays_in_week_nights, breaks = c(0, 1, 2, 3, 4, 5), 
+           include_outside_range = TRUE) |>
+  step_mutate(no_company = ifelse(company == "NULL", 1, 0)) |>
+  step_mutate(arrival_date = lubridate::ymd(arrival_date)) |>
+  step_mutate(month = lubridate::month(arrival_date)) |>
+  step_mutate(month = as.factor(month)) |>
+  step_mutate(waiting_list = ifelse(days_in_waiting_list == 0, 0, 1)) |>
+  step_mutate(previous_cancellations = ifelse(previous_cancellations == 0, 0, 1)) |>
+  step_mutate(previous_bookings_not_canceled = 
+                ifelse(previous_bookings_not_canceled == 0, 0, 1)) |>
+  step_relevel(meal, ref_level = "Undefined", skip=TRUE) |>
+  step_mutate(market_segment = ifelse(market_segment=="Direct", 1, 
+                                      ifelse(market_segment == "Online_TA", 1, 
+                                      ifelse(market_segment == "Offline_TA/TO", 1, 0)))) |>
+  step_mutate(customer_type = ifelse(customer_type == "Transient", 1, 
+                                     ifelse(customer_type == "Transient-Party", 1, 0))) |>
+  step_relevel(region, ref_level = "Europe", skip = TRUE) |>
+  step_mutate(is_prt = ifelse(country_code == "PRT", 1, 0)) |>
+  step_cut(total_of_special_requests, breaks = c(0, 1, 2, 3, 4, 5)) |>
+  step_dummy(meal,
+             reserved_room_type,
+             assigned_room_type,
+             stays_in_weekend_nights,
+             stays_in_week_nights,
+             total_of_special_requests,
+             month,
+             region) |>
+  step_select(-arrival_date, skip = TRUE) |>
+  step_select(-country_code, skip = TRUE) |>
+  step_select(-company, skip = TRUE) |>
+  step_select(-days_in_waiting_list, skip = TRUE) |>
+  step_interact(terms = ~ hotel:starts_with("reserved_room_type")) |>
+  step_interact(terms = ~ hotel:starts_with("assigned_room_type")) |>
+  step_interact(terms = ~ hotel:starts_with("market_segment")) |>
+  step_interact(terms = ~ hotel:starts_with("customer_type")) |>
+  step_interact(terms = ~ hotel:starts_with("stays_in_weekend_nights")) |>
+  step_interact(terms = ~ hotel:starts_with("stays_in_week_nights")) |>
+  step_interact(terms = ~ hotel:starts_with("is_prt")) |>
+  step_interact(terms = ~ hotel:starts_with("month")) |>
+  step_interact(terms = ~ hotel:starts_with("waiting_list")) |>
+  step_interact(terms = ~ adults:starts_with("market_segment")) |>
+  step_interact(terms = ~ adults:starts_with("reserved_room_type")) |>
+  step_interact(terms = ~ adults:starts_with("assigned_room_type")) |>
+  step_interact(terms = ~ adults:starts_with("stays_in_weekend_nights")) |>
+  step_interact(terms = ~ adults:starts_with("stays_in_week_nights")) |>
+  step_interact(terms = ~ adults:starts_with("customer_type")) |>
+  step_interact(terms = ~ adults:starts_with("region")) |>
+  step_interact(terms = ~ adults:starts_with("meal")) |>
+  step_interact(terms = ~ adults:starts_with("is_prt")) |>
+  step_interact(terms = ~ adults:starts_with("month")) |>
+  step_interact(terms = ~ adults:starts_with("total_of_special_requests")) |>
+  step_interact(terms = ~ adults:starts_with("no_company")) |>
+  step_interact(terms = ~ adults:starts_with("waiting_list")) |>
+  step_interact(terms = ~ adults:starts_with("previous_cancellations")) |>
+  step_interact(terms = ~ adults:starts_with("previous_bookings_not_canceled")) |>
+  step_interact(terms = ~ lead_time:starts_with("reserved_room_type")) |>
+  step_interact(terms = ~ lead_time:starts_with("region")) |>
+  step_interact(terms = ~ lead_time:starts_with("customer_type")) |>
+  step_interact(terms = ~ lead_time:starts_with("market_segment")) |>
+  step_interact(terms = ~ lead_time:starts_with("stays_in_weekend_nights")) |>
+  step_interact(terms = ~ lead_time:starts_with("stays_in_week_nights")) |>
+  step_interact(terms = ~ lead_time:starts_with("is_prt")) |>
+  step_interact(terms = ~ lead_time:starts_with("month")) |>
+  step_interact(terms = ~ lead_time:starts_with("no_company")) |>
+  step_interact(terms = ~ lead_time:starts_with("previous_cancellations")) |>
+  step_interact(terms = ~ lead_time:starts_with("previous_bookings_not_canceled")) |>
+  step_interact(terms = ~ lead_time:starts_with("waiting_list")) |>
+  step_interact(terms = ~ average_daily_rate:starts_with("adults")) |>
+  step_interact(terms = ~ average_daily_rate:starts_with("reserved_room_type")) |>
+  step_interact(terms = ~ average_daily_rate:starts_with("assigned_room_type")) |>
+  step_interact(terms = ~ average_daily_rate:starts_with("customer_type")) |>
+  step_interact(terms = ~ average_daily_rate:starts_with("region")) |>
+  step_interact(terms = ~ average_daily_rate:starts_with("meal")) |>
+  step_interact(terms = ~ average_daily_rate:starts_with("is_prt")) |>
+  step_interact(terms = ~ average_daily_rate:starts_with("month")) |>
+  step_interact(terms = ~ average_daily_rate:starts_with("total_of_special_requests")) |>
+  step_interact(terms = ~ average_daily_rate:starts_with("no_company")) |>
+  step_interact(terms = ~ no_company:starts_with("customer_type")) |>
+  step_interact(terms = ~ no_company:starts_with("reserved_room_type")) |>
+  step_interact(terms = ~ no_company:starts_with("market_segment")) |>
+  step_interact(terms = ~ no_company:starts_with("is_prt")) |>
+  step_interact(terms = ~ no_company:starts_with("total_of_special_requests")) |>
+  step_interact(terms = ~ no_company:starts_with("waiting_list")) |>
+  step_interact(terms = ~ no_company:starts_with("previous_cancellations")) |>
+  step_interact(terms = ~ no_company:starts_with("previous_bookings_not_canceled")) |>
+  step_interact(terms = ~ is_prt:starts_with("market_segment")) |>
+  step_interact(terms = ~ is_prt:starts_with("reserved_room_type")) |>
+  step_interact(terms = ~ is_prt:starts_with("region")) |>
+  step_interact(terms = ~ is_prt:starts_with("customer_type")) |>
+  step_interact(terms = ~ is_prt:starts_with("month")) |>
+  step_interact(terms = ~ is_prt:starts_with("total_of_special_requests")) |>
+  step_interact(terms = ~ is_prt:starts_with("waiting_list")) |>
+  step_interact(terms = ~ is_prt:starts_with("previous_cancellations")) |>
+  step_interact(terms = ~ is_prt:starts_with("previous_bookings_not_canceled"))
+```
+
+```{r}
+receta_normalized <-
+  receta_hoteles |> step_normalize(all_predictors())
+```
+
+```{r}
+receta_hoteles_prep <- prep(receta_hoteles, verbose = TRUE)
+hoteles_tbl <- juice(receta_hoteles_prep)
+dim(hoteles_tbl)
+```
+
+```{r}
+receta_hoteles_prep_norm <- prep(receta_normalized, verbose = TRUE)
+hoteles_tbl_norm <- juice(receta_hoteles_prep_norm)
+dim(hoteles_tbl_norm)
+```
+
+### modelo_lightgbm
+
+```{r}
+modelo_lightgbm <- 
+  boost_tree(trees = 1000, 
+  tree_depth = tune(), min_n = tune(), 
+  loss_reduction = tune(),
+  sample_size = tune(), mtry = tune(),
+  learn_rate = tune()) |>
+  set_engine("lightgbm") |>
+  set_mode("classification")
+  
+flujo_hoteles <- workflow() |> 
+  add_recipe(receta_hoteles) |> 
+  add_model(modelo_lightgbm)
+```
+
+Y ahora ajustamos todos los modelos.
+
+```{r}
+particion_vc <- vfold_cv(hoteles_df, v = 10, strata=children)
+mis_metricas <- metric_set(roc_auc, mn_log_loss)
+
+gbm_random_grid <- parameters(modelo_lightgbm) %>% 
+    finalize(hoteles_tbl) %>% 
+    grid_random(size = 200)
+
+head(gbm_random_grid)
+```
+
+```{r}
+# gbm_grid <- grid_latin_hypercube(
+#   tree_depth(),
+#   min_n(),
+#   loss_reduction(),
+#   sample_size = sample_prop(),
+#   finalize(mtry(), hoteles_df),
+#   learn_rate(),
+#   size = 70
+# )
+
+eval_tbl <- tune_grid(flujo_hoteles,
+                      resamples = particion_vc,
+                      grid = gbm_random_grid,
+                      control = control_grid(verbose = TRUE),
+                      metrics = mis_metricas)
+```
+
+```{r}
+# particion_vc <- vfold_cv(hoteles_df, v = 10, strata = children)
+# mis_metricas <- metric_set(mn_log_loss)
+# 
+# xgb_rs <- tune_race_anova(
+#   flujo_hoteles,
+#   resamples = particion_vc,
+#   grid = 15,
+#   metrics = metric_set(mn_log_loss),
+#   control = control_race(verbose_elim = TRUE)
+# )
+```
+
+```{r}
+ajustes_tbl <- eval_tbl |>
+  unnest(cols = c(.metrics)) |> 
+  select(id, mtry, min_n, tree_depth, learn_rate, loss_reduction, sample_size, .metric, .estimate)
+ajustes_tbl
+```
+
+```{r}
+show_best(eval_tbl, "roc_auc", n=10)
+```
+
+```{r}
+eval_tbl %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, min_n, mtry) %>%
+  pivot_longer(min_n:mtry,
+    values_to = "value",
+    names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")
+```
+
+Finalmente, seleccionamos el mejor modelo:
+
+```{r}
+mejor_modelo <- select_best(eval_tbl, "roc_auc")
+mejor_modelo
+```
+
+```{r}
+modelo_final <- finalize_workflow(flujo_hoteles, mejor_modelo) |> 
+  fit(hoteles_df)
+```
+
+### Análisis de las probabilidades de compra
+
+```{r, message = FALSE}
+hoteles_test <- read_csv("./hoteles-prueba.csv", show_col_types = FALSE)
+
+hoteles_test <- left_join(x=hoteles_test, y=pct_children_df, by="country")
+
+colnames(hoteles_test)[8] <- "country_code"
+hoteles_test <- hoteles_test |> 
+  mutate(country_code = ifelse(country_code == "NULL", names(country_mode), country_code)) |>
+  mutate(country_code = ifelse(country_code == "CN", "CHN", country_code))
+```
+
+```{r}
+hoteles_test <- left_join(x=hoteles_test, y=countries, by="country_code")
+hoteles_test <- hoteles_test |>
+  mutate(region = ifelse(country_code == "TMP", "Asia", region))
+hoteles_test <- hoteles_test |> mutate(region = as.factor(region))
+hoteles_test <- hoteles_test |> arrange(id)
+```
+
+```{r}
+pred_probas <- predict(modelo_final, hoteles_test, type="prob") 
+head(pred_probas)
+```
+
+```{r}
+res <- bind_cols(id = seq(1:nrow(hoteles_test)), prob = pred_probas$.pred_1)
+write.csv(res,"lightgbm_log_loss_2.csv", row.names = FALSE)
+```
+
+```{r}
+pred_probas <- pred_probas |> 
+  bind_cols(hoteles_test)
+head(pred_probas |> select(.pred_1, .pred_0))
+```
